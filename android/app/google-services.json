@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "561770633621",
+    "project_id": "knocktalk-a918d",
+    "storage_bucket": "knocktalk-a918d.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:561770633621:android:003fff692d7fe0da20be9c",
+        "android_client_info": {
+          "package_name": "com.example.KnockTalk"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCxOjCtZUxWwVvXF8LS1dNukjdu8DZkmjE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

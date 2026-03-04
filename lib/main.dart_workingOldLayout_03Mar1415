@@ -1,0 +1,601 @@
+import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:flutter/material.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import 'dart:convert';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'firebase_options.dart';
+
+// ─── CONFIG ───────────────────────────────────────────
+const String MY_ROOM_ID = 'home-front-door-a3f9';
+const String SIGNAL_SERVER = 'wss://knocktalk.duckdns.org';
+const String TURN_USERNAME = 'knocktalkadm';
+const String TURN_PASSWORD = 'BUuBetKwBf&daR@1!1';
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  print('Background notification received: ${message.data}');
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+  final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
+  final bool hasIncomingCall = initialMessage != null &&
+      initialMessage.data['type'] == 'incoming-call';
+
+  runApp(ScanCallApp(openWaiting: hasIncomingCall, incomingCall: hasIncomingCall));
+}
+
+class ScanCallApp extends StatelessWidget {
+  final bool openWaiting;
+  final bool incomingCall;
+  const ScanCallApp({super.key, this.openWaiting = false, this.incomingCall = false});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      navigatorKey: navigatorKey,
+      home: openWaiting
+          ? WaitingScreen(autoIncomingCall: incomingCall)
+          : const HomeScreen(),
+    );
+  }
+}
+
+// ─── HOME SCREEN ───────────────────────────────────────
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+
+  @override
+  void initState() {
+    super.initState();
+    _setupNotifications();
+  }
+
+  Future<void> _setupNotifications() async {
+    final messaging = FirebaseMessaging.instance;
+
+    await messaging.requestPermission(
+      alert: true,
+      badge: true,
+      sound: true,
+    );
+
+    final token = await messaging.getToken();
+    print('FCM Token: $token');
+
+    if (token != null) {
+      _registerTokenWithServer(token);
+    }
+
+    messaging.onTokenRefresh.listen((newToken) {
+      _registerTokenWithServer(newToken);
+    });
+
+    FirebaseMessaging.onMessageOpenedApp.listen((message) {
+      if (message.data['type'] == 'incoming-call') {
+        navigatorKey.currentState?.pushReplacement(
+          MaterialPageRoute(
+            builder: (_) => WaitingScreen(autoIncomingCall: true),
+          ),
+        );
+      }
+    });
+
+    FirebaseMessaging.onMessage.listen((message) {
+      if (message.data['type'] == 'incoming-call') {
+        navigatorKey.currentState?.pushReplacement(
+          MaterialPageRoute(builder: (_) => WaitingScreen(autoIncomingCall: true)),
+        );
+      }
+    });
+  }
+
+  void _registerTokenWithServer(String token) {
+    try {
+      final channel = WebSocketChannel.connect(Uri.parse(SIGNAL_SERVER));
+      channel.sink.add(jsonEncode({
+        'type': 'register-token',
+        'roomId': MY_ROOM_ID,
+        'fcmToken': token,
+      }));
+      Future.delayed(const Duration(seconds: 2), () {
+        channel.sink.close();
+      });
+    } catch (e) {
+      print('Failed to register token: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("KnockTalk")),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            QrImageView(
+              data: 'https://knocktalk.duckdns.org/call.html?room=$MY_ROOM_ID',
+              size: 220,
+            ),
+            const SizedBox(height: 8),
+            const Text("Show this QR at your door",
+                style: TextStyle(color: Colors.grey)),
+            const SizedBox(height: 40),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.call),
+              label: const Text("Wait for Calls"),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.green,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+              ),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const WaitingScreen()),
+                );
+              },
+            ),
+            const SizedBox(height: 20),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.qr_code_scanner),
+              label: const Text("Scan QR to Call Someone"),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const ScannerScreen()),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ─── WAITING SCREEN ────────────────────────────────────
+class WaitingScreen extends StatefulWidget {
+  final bool autoIncomingCall;
+  const WaitingScreen({super.key, this.autoIncomingCall = false});
+
+  @override
+  State<WaitingScreen> createState() => _WaitingScreenState();
+}
+
+class _WaitingScreenState extends State<WaitingScreen> {
+  late WebSocketChannel _channel;
+  late Stream<dynamic> _broadcastStream;
+  bool _incomingCall = false;
+  bool _answered = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.autoIncomingCall) {
+      _incomingCall = true;
+    }
+    _listenForCalls();
+  }
+
+  void _listenForCalls() {
+    _channel = WebSocketChannel.connect(Uri.parse(SIGNAL_SERVER));
+    // Convert to broadcast so multiple listeners can use same stream
+    _broadcastStream = _channel.stream.asBroadcastStream();
+
+    _channel.sink.add(jsonEncode({
+      'type': 'host-listen',
+      'roomId': MY_ROOM_ID,
+    }));
+
+    _broadcastStream.listen(
+      (message) {
+        final data = jsonDecode(message);
+        if (data['type'] == 'incoming-call') {
+          setState(() => _incomingCall = true);
+        }
+      },
+      onError: (error) {
+        print('WebSocket error: $error');
+      },
+      onDone: () {
+        print('WebSocket closed, _answered: $_answered');
+        if (!_answered && mounted) {
+          Future.delayed(const Duration(seconds: 2), () {
+            if (!_answered && mounted) {
+              _listenForCalls();
+            }
+          });
+        }
+      },
+    );
+  }
+
+  void _answerCall() {
+    _answered = true;
+
+    _channel.sink.add(jsonEncode({
+      'type': 'host-answer',
+      'roomId': MY_ROOM_ID,
+    }));
+
+    // Pass same channel AND broadcast stream to CallScreen
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CallScreen(
+          roomId: MY_ROOM_ID,
+          isHost: true,
+          channel: _channel,
+          broadcastStream: _broadcastStream,
+        ),
+      ),
+    );
+  }
+
+  void _rejectCall() {
+    setState(() => _incomingCall = false);
+  }
+
+  @override
+  void dispose() {
+    // Only close channel if we did NOT answer — if answered, CallScreen owns it
+    if (!_answered) {
+      _channel.sink.close();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("Waiting for calls...")),
+      body: Center(
+        child: _incomingCall
+            ? Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.person, size: 80, color: Colors.blue),
+                  const SizedBox(height: 16),
+                  const Text("Someone is at your door!",
+                      style: TextStyle(fontSize: 22)),
+                  const SizedBox(height: 40),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      FloatingActionButton(
+                        heroTag: 'reject',
+                        backgroundColor: Colors.red,
+                        onPressed: _rejectCall,
+                        child: const Icon(Icons.call_end),
+                      ),
+                      const SizedBox(width: 40),
+                      FloatingActionButton(
+                        heroTag: 'answer',
+                        backgroundColor: Colors.green,
+                        onPressed: _answerCall,
+                        child: const Icon(Icons.call),
+                      ),
+                    ],
+                  )
+                ],
+              )
+            : const Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 20),
+                  Text("Waiting for someone to scan your QR..."),
+                ],
+              ),
+      ),
+    );
+  }
+}
+
+// ─── SCANNER SCREEN ────────────────────────────────────
+class ScannerScreen extends StatefulWidget {
+  const ScannerScreen({super.key});
+
+  @override
+  State<ScannerScreen> createState() => _ScannerScreenState();
+}
+
+class _ScannerScreenState extends State<ScannerScreen> {
+  bool isNavigating = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("Scan QR Code")),
+      body: MobileScanner(
+        onDetect: (capture) {
+          if (isNavigating) return;
+          final code = capture.barcodes.first.rawValue;
+          if (code != null) {
+            isNavigating = true;
+            final channel = WebSocketChannel.connect(Uri.parse(SIGNAL_SERVER));
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (_) => CallScreen(
+                  roomId: code,
+                  isHost: false,
+                  channel: channel,
+                ),
+              ),
+            );
+          }
+        },
+      ),
+    );
+  }
+}
+
+// ─── CALL SCREEN ───────────────────────────────────────
+class CallScreen extends StatefulWidget {
+  final String roomId;
+  final bool isHost;
+  final WebSocketChannel channel;
+  final Stream<dynamic>? broadcastStream;
+
+  const CallScreen({
+    super.key,
+    required this.roomId,
+    required this.isHost,
+    required this.channel,
+    this.broadcastStream,
+  });
+
+  @override
+  State<CallScreen> createState() => _CallScreenState();
+}
+
+class _CallScreenState extends State<CallScreen> {
+  RTCVideoRenderer? _localRenderer;
+  RTCVideoRenderer? _remoteRenderer;
+  RTCPeerConnection? _peerConnection;
+  MediaStream? _localStream;
+
+  final Map<String, dynamic> iceConfig = {
+    'iceServers': [
+      {'urls': 'stun:stun.l.google.com:19302'},
+      {
+        'urls': [
+          'turn:knocktalk.duckdns.org:3478',
+          'turns:knocktalk.duckdns.org:5349'
+        ],
+        'username': TURN_USERNAME,
+        'credential': TURN_PASSWORD,
+      }
+    ]
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _start();
+  }
+
+  Future<void> _start() async {
+    await _initRenderers();
+    _listenToSignaling();
+
+    if (widget.isHost) {
+      // Same channel as WaitingScreen — just create peer connection and wait for create-offer
+      await _createPeerConnection();
+      // Tell server this host connection is now in call mode
+      widget.channel.sink.add(jsonEncode({
+        'type': 'host-answer-ready',
+        'roomId': widget.roomId,
+      }));
+    } else {
+      widget.channel.sink.add(jsonEncode({
+        'type': 'guest-join',
+        'roomId': widget.roomId,
+      }));
+    }
+  }
+
+  Future<void> _initRenderers() async {
+    await Permission.camera.request();
+    await Permission.microphone.request();
+
+    _localRenderer = RTCVideoRenderer();
+    _remoteRenderer = RTCVideoRenderer();
+    await _localRenderer!.initialize();
+    await _remoteRenderer!.initialize();
+
+    _localStream = await navigator.mediaDevices.getUserMedia({
+      'audio': true,
+      'video': {
+        'facingMode': 'user',
+        'width': 640,
+        'height': 480,
+        'frameRate': 30,
+      },
+    });
+
+    _localRenderer!.srcObject = _localStream;
+    setState(() {});
+  }
+
+  void _listenToSignaling() {
+    // Use broadcast stream if passed (host reusing WaitingScreen channel)
+    // Otherwise use channel stream directly (guest with fresh channel)
+    final stream = widget.broadcastStream ?? widget.channel.stream;
+
+    stream.listen((message) async {
+      final data = jsonDecode(message);
+
+      if (data['type'] == 'create-offer') {
+        print('Received create-offer, creating offer...');
+        final offer = await _peerConnection!.createOffer();
+        await _peerConnection!.setLocalDescription(offer);
+        widget.channel.sink.add(jsonEncode({
+          'type': 'signal',
+          'roomId': widget.roomId,
+          'signal': offer.toMap(),
+        }));
+      }
+
+      if (data['type'] == 'signal') {
+        final signal = data['signal'];
+
+        if (signal['type'] == 'offer') {
+          await _createPeerConnection();
+          await _peerConnection!.setRemoteDescription(
+            RTCSessionDescription(signal['sdp'], signal['type']),
+          );
+          final answer = await _peerConnection!.createAnswer();
+          await _peerConnection!.setLocalDescription(answer);
+          widget.channel.sink.add(jsonEncode({
+            'type': 'signal',
+            'roomId': widget.roomId,
+            'signal': answer.toMap(),
+          }));
+        }
+
+        if (signal['type'] == 'answer') {
+          await _peerConnection!.setRemoteDescription(
+            RTCSessionDescription(signal['sdp'], signal['type']),
+          );
+        }
+
+        if (signal['candidate'] != null) {
+          if (_peerConnection != null) {
+            await _peerConnection!.addCandidate(
+              RTCIceCandidate(
+                signal['candidate'],
+                signal['sdpMid'],
+                signal['sdpMLineIndex'],
+              ),
+            );
+          }
+        }
+      }
+
+      if (data['type'] == 'guest-disconnected') {
+        print('Guest disconnected');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Guest has disconnected')),
+          );
+        }
+      }
+    });
+  }
+
+  Future<void> _createPeerConnection() async {
+    if (_peerConnection != null) return;
+
+    _peerConnection = await createPeerConnection(iceConfig);
+
+    _localStream?.getTracks().forEach((track) {
+      _peerConnection?.addTrack(track, _localStream!);
+    });
+
+    _peerConnection?.onIceCandidate = (candidate) {
+      if (candidate != null) {
+        widget.channel.sink.add(jsonEncode({
+          'type': 'signal',
+          'roomId': widget.roomId,
+          'signal': {
+            'candidate': candidate.candidate,
+            'sdpMid': candidate.sdpMid,
+            'sdpMLineIndex': candidate.sdpMLineIndex,
+          }
+        }));
+      }
+    };
+
+    _peerConnection!.onTrack = (RTCTrackEvent event) {
+      print("Received remote track: ${event.track.kind}");
+      if (event.streams.isNotEmpty && event.track.kind == 'video') {
+        _remoteRenderer!.srcObject = event.streams[0];
+        setState(() {});
+      }
+    };
+
+    _peerConnection?.onIceConnectionState = (state) {
+      print("ICE state: $state");
+    };
+
+    _peerConnection?.onConnectionState = (state) {
+      print("Connection state: $state");
+    };
+  }
+
+  @override
+  void dispose() {
+    // Notify server that host ended call
+    if (widget.isHost) {
+      try {
+        widget.channel.sink.add(jsonEncode({
+          'type': 'host-end-call',
+          'roomId': widget.roomId,
+        }));
+      } catch (e) {
+        print('Error sending end call: $e');
+      }
+    }
+    _localRenderer?.dispose();
+    _remoteRenderer?.dispose();
+    _peerConnection?.close();
+    _localStream?.getTracks().forEach((t) => t.stop());
+    _localStream?.dispose();
+    widget.channel.sink.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.isHost ? "In Call" : "Calling..."),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: _remoteRenderer != null
+                ? RTCVideoView(_remoteRenderer!)
+                : const Center(child: Text("Waiting for remote video...")),
+          ),
+          Container(
+            height: 160,
+            color: Colors.black,
+            child: _localRenderer != null
+                ? RTCVideoView(_localRenderer!, mirror: true)
+                : const SizedBox(),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: FloatingActionButton(
+              backgroundColor: Colors.red,
+              onPressed: () => Navigator.pop(context),
+              child: const Icon(Icons.call_end),
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}
